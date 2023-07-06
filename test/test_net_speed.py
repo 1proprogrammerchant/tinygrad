@@ -12,12 +12,12 @@ def start_profile():
   pr.enable()
   return pr
 
-def stop_profile(pr, sort='cumtime'):
+def stop_profile(pr, sort='cumtime', frac=0.2):
   pr.disable()
   ps = pstats.Stats(pr)
   ps.strip_dirs()
   ps.sort_stats(sort)
-  ps.print_stats(0.2)
+  ps.print_stats(frac)
 
 class TestConvSpeed(unittest.TestCase):
 
@@ -63,9 +63,9 @@ class TestConvSpeed(unittest.TestCase):
 
     # ****** tinygrad compare *******
 
-    c1 = Tensor(c1.detach().numpy())
-    c2 = Tensor(c2.detach().numpy())
-    l1 = Tensor(l1.detach().numpy())
+    c1 = Tensor(c1.detach().numpy(), requires_grad=True)
+    c2 = Tensor(c2.detach().numpy(), requires_grad=True)
+    l1 = Tensor(l1.detach().numpy(), requires_grad=True)
 
     cnt = 5
     fpt, bpt = 0.0, 0.0
@@ -77,8 +77,10 @@ class TestConvSpeed(unittest.TestCase):
       x = x.reshape(shape=(x.shape[0], -1))
       out = x.dot(l1).log_softmax()
       out = out.mean()
+      out.realize()
       et1 = time.time()
       out.backward()
+      [x.grad.realize() for x in [c1, c2, l1]]
       et2 = time.time()
       if i == 0:
         pr = start_profile()

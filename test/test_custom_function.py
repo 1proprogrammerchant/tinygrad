@@ -10,21 +10,22 @@ from tinygrad.helpers import prod, dtypes
 # `atan2_gpu` for GPUBuffers and `atan2_cpu` for CPUBuffers
 from tinygrad.lazy import LazyBuffer, create_lazybuffer, Device
 from tinygrad.ops import ASTRunner
+from tinygrad.shape.shapetracker import ShapeTracker
 
 # we don't always have GPU support, so the type signature is the abstract CompiledBuffer instead of GPUBuffer
 def atan2_gpu(ret:LazyBuffer, a:LazyBuffer, b:LazyBuffer):
   assert a.device == "GPU" and b.device == "GPU", "gpu function requires GPUBuffers"
   assert a.dtype == b.dtype and a.dtype == dtypes.float32, "gpu function only supports float32"
   ret.realized = Device[ret.device].buffer(prod(ret.shape), ret.dtype)
-  ASTRunner("atan2", """
-    __kernel void atan2(global float *c, global float *a, global float *b) {
+  ASTRunner("atan2_gpu", """
+    __kernel void atan2_gpu(global float *c, global float *a, global float *b) {
       int idx = get_global_id(0);
       c[idx] = atan2(a[idx], b[idx]);
     }""", global_size=[prod(ret.shape)]).build(Device[ret.device].runtime).exec([ret, a, b])
   return ret.realized
 
 def atan2_cpu(ret:LazyBuffer, a:LazyBuffer, b:LazyBuffer):
-  return Device[ret.device].buffer(np.arctan2(a.realized._buf, b.realized._buf))
+  return Device[ret.device].from_underlying(np.arctan2(a.realized._buf, b.realized._buf))
 
 # *** second, we write the ATan2 mlop ***
 # NOTE: The derivative of atan2 doesn't need a custom op! https://www.liquisearch.com/atan2/derivative
@@ -39,7 +40,7 @@ class ATan2(Function):
     assert prod(a.shape) == prod(b.shape) and a.device == b.device, "shape or device mismatch"
     self.a, self.b = a, b
     ast = LazyOp(LoadOps.CUSTOM, (a.contiguous(), b.contiguous()), {"GPU": atan2_gpu, "CPU": atan2_cpu}[a.device])
-    return create_lazybuffer(a.device, a.shape, LoadOps, ast, max(a.dtype, b.dtype))
+    return create_lazybuffer(a.device, ShapeTracker(a.shape), LoadOps, ast, max(a.dtype, b.dtype))
   def backward(self, grad_output:LazyBuffer) -> Tuple[Optional[LazyBuffer], Optional[LazyBuffer]]:
     denom = (self.a.binary_op(BinaryOps.MUL, self.a)).binary_op(BinaryOps.ADD, self.b.binary_op(BinaryOps.MUL, self.b))
     return grad_output.binary_op(BinaryOps.MUL, self.b.binary_op(BinaryOps.DIV, denom)) if self.needs_input_grad[0] else None, \

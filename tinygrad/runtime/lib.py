@@ -11,8 +11,11 @@ class RawBuffer:  # pylint: disable=abstract-method
     self._buf = buf
     self._memsz: int = size*dtype.itemsize
     GlobalCounters.mem_used += self._memsz
-  def __del__(self): GlobalCounters.mem_used -= self._memsz
+  def __del__(self):  # NOTE: if it fails on init (bad dtype), it won't have a _memsz
+    if hasattr(self, '_memsz'): GlobalCounters.mem_used -= self._memsz
   def __repr__(self): return f"buffer<{self.size}, {self.dtype}>"
+  @property
+  def key(self): return (self.size, self.dtype.key)
 
   # NOTE: this interface allows for 0 copy
   @classmethod
@@ -30,12 +33,13 @@ class RawBufferCopyIn(RawBuffer):
 
 class RawBufferMapped(RawBufferCopyIn):
   def _buffer(self) -> memoryview: raise NotImplementedError("must be implemented")
-  def toCPU(self) -> np.ndarray: return np.frombuffer(self._buffer(), dtype=self.dtype.np)
+  # NOTE: this metadata prevents the backing buffer from being freed. hack can be removed with PEP688
+  def toCPU(self) -> np.ndarray: return np.frombuffer(self._buffer(), dtype=np.dtype(self.dtype.np, metadata={"backing": self}))  # type: ignore
   def _copyin(self, x:np.ndarray) -> None: np.copyto(self.toCPU(), x.reshape(-1))
 
 # this one is simple enough that i moved it out of the runtimes
 class RawMallocBuffer(RawBufferMapped):
-  def __init__(self, size, dtype: DType): super().__init__(size, dtype, ({dtypes.float32: ctypes.c_float, dtypes.float16: ctypes.c_int16}[dtype] * size)())
+  def __init__(self, size, dtype: DType): super().__init__(size, dtype, ({dtypes.float32: ctypes.c_float, dtypes.float16: ctypes.c_int16, dtypes.int8: ctypes.c_int8, dtypes.uint8: ctypes.c_uint8, dtypes.bool: ctypes.c_uint8, dtypes.int32: ctypes.c_int32, dtypes.int64: ctypes.c_int64}[dtype] * size)())
   def _buffer(self): return memoryview(self._buf)
 
 class RawBufferCopyInOut(RawBufferCopyIn):
@@ -48,3 +52,5 @@ class RawBufferCopyInOut(RawBufferCopyIn):
 
 class RawConst(RawBuffer): # pylint: disable=abstract-method
   def __repr__(self): return f"const<{self._buf}, {self.dtype}>"
+  @property
+  def key(self): return (str(self._buf), self.dtype.key)

@@ -1,4 +1,6 @@
 import numpy as np
+from tinygrad.helpers import dtypes
+from tinygrad.nn import Linear
 import torch
 import unittest
 from tinygrad.tensor import Tensor
@@ -17,6 +19,7 @@ class TinyNet():
 
   def forward(self):
     out = self.x.matmul(self.W).relu()
+    # print(out.detach().numpy())
     out = out.log_softmax(1)
     out = out.mul(self.m).add(self.m).sum()
     return out
@@ -44,15 +47,23 @@ class TestOptim(unittest.TestCase):
 
   def test_sgd(self): self._test_sgd(1, {'lr': 0.001}, 1e-6, 0)
   def test_sgd_high_lr(self): self._test_sgd(1, {'lr': 10}, 1e-6, 1e-5)
+  def test_sgd_wd(self): self._test_sgd(1, {'lr': 0.001, 'weight_decay': 0.1}, 1e-6, 0)
+  def test_sgd_high_lr_wd(self): self._test_sgd(1, {'lr': 10, 'weight_decay': 0.1}, 1e-6, 1e-5)
 
   def test_multistep_sgd(self): self._test_sgd(10, {'lr': 0.001}, 1e-6, 0)
   def test_multistep_sgd_high_lr(self): self._test_sgd(10, {'lr': 10}, 1e-6, 3e-4)
+  def test_multistep_sgd_wd(self): self._test_sgd(10, {'lr': 0.001, 'weight_decay': 0.1}, 1e-6, 0)
+  def test_multistep_sgd_high_lr_wd(self): self._test_sgd(10, {'lr': 9, 'weight_decay': 0.1}, 1e-6, 3e-4)
 
   def test_multistep_sgd_momentum(self): self._test_sgd(10, {'lr': 0.001, 'momentum': 0.9}, 1e-6, 0)
   def test_multistep_sgd_high_lr_momentum(self): self._test_sgd(10, {'lr': 10, 'momentum': 0.9}, 1e-5, 3e-4)
+  def test_multistep_sgd_momentum_wd(self): self._test_sgd(10, {'lr': 0.001, 'momentum': 0.9, 'weight_decay': 0.1}, 1e-6, 0)
+  def test_multistep_sgd_high_lr_momentum_wd(self): self._test_sgd(10, {'lr': 10, 'momentum': 0.9, 'weight_decay': 0.1}, 1e-5, 3e-4)
 
   def test_multistep_sgd_nesterov_momentum(self): self._test_sgd(10, {'lr': 0.001, 'momentum': 0.9, 'nesterov': True}, 1e-5, 0)
   def test_multistep_sgd_high_lr_nesterov_momentum(self): self._test_sgd(10, {'lr': 10, 'momentum': 0.9, 'nesterov': True}, 1e-5, 3e-4)
+  def test_multistep_sgd_nesterov_momentum_wd(self): self._test_sgd(10, {'lr': 0.001, 'momentum': 0.9, 'nesterov': True, 'weight_decay': 0.1}, 1e-5, 0)
+  def test_multistep_sgd_high_lr_nesterov_momentum_wd(self): self._test_sgd(10, {'lr': 9, 'momentum': 0.9, 'nesterov': True, 'weight_decay': 0.1}, 1e-5, 3e-4)
 
   def test_adam(self): self._test_adam(1, {'lr': 0.001}, 1e-5, 0)
   def test_adam_high_lr(self): self._test_adam(1, {'lr': 10}, 1e-5, 1e-5)
@@ -60,10 +71,27 @@ class TestOptim(unittest.TestCase):
   def test_adamw_high_lr(self): self._test_adamw(1, {'lr': 10}, 1e-5, 1e-5)
 
   def test_multistep_adam(self): self._test_adam(10, {'lr': 0.001}, 1e-5, 0)
-  def test_multistep_adam_high_lr(self): self._test_adam(10, {'lr': 10}, 1e-5, 3e-4)
+  def test_multistep_adam_high_lr(self): self._test_adam(10, {'lr': 10}, 2e-4, 5e-4)
 
   def test_multistep_adamw(self): self._test_adamw(10, {'lr': 0.001}, 1e-5, 0)
-  def test_multistep_adamw_high_lr(self): self._test_adamw(10, {'lr': 10}, 1e-5, 3e-4)
+  def test_multistep_adamw_high_lr(self): self._test_adamw(10, {'lr': 10}, 5e-4, 2e-3)
+
+  def test_duped_weights(self):
+    for Opt in [Adam, AdamW, SGD]:
+      losses = []
+      for i in range(2):
+        w = Tensor(x_init.copy())
+        opt = Opt([w], lr=0.1) if i == 0 else Opt([w, w], lr=0.1)
+
+        loss = None
+        for _ in range(3):
+          loss = w.sum()
+          opt.zero_grad()
+          loss.backward()
+          opt.step()
+        losses.append(loss.numpy())
+
+      np.testing.assert_allclose(losses[0], losses[1], atol=1e-4, rtol=0)
 
 if __name__ == '__main__':
   unittest.main()

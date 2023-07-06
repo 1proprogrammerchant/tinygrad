@@ -1,37 +1,50 @@
 import pickle
 import numpy as np
 from tqdm import tqdm
-import tempfile, platform
+import tempfile, platform, os
 from collections import defaultdict
-from tinygrad.helpers import prod, getenv, DEBUG
+from tinygrad.helpers import prod, getenv, DEBUG, dtypes
 from tinygrad.ops import GlobalCounters
 from tinygrad.tensor import Tensor
-from tinygrad.lazy import LazyNumpyArray, Device
+from tinygrad.lazy import Device
 from tinygrad.shape.shapetracker import strides_for_shape
 OSX = platform.system() == "Darwin"
+WINDOWS = platform.system() == "Windows"
+
+def temp(x:str) -> str: return os.path.join(tempfile.gettempdir(), x)
 
 def fetch(url):
   if url.startswith("/"):
     with open(url, "rb") as f:
       return f.read()
-  import os, hashlib, tempfile
-  fp = os.path.join(tempfile.gettempdir(), hashlib.md5(url.encode('utf-8')).hexdigest())
+  import hashlib
+  fp = temp(hashlib.md5(url.encode('utf-8')).hexdigest())
   download_file(url, fp, skip_if_exists=not getenv("NOCACHE"))
   with open(fp, "rb") as f:
     return f.read()
 
+def fetch_as_file(url):
+  if url.startswith("/"):
+    with open(url, "rb") as f:
+      return f.read()
+  import hashlib
+  fp = temp(hashlib.md5(url.encode('utf-8')).hexdigest())
+  download_file(url, fp, skip_if_exists=not getenv("NOCACHE"))
+  return fp
+
 def download_file(url, fp, skip_if_exists=True):
-  import requests, os
+  import requests, os, pathlib
   if skip_if_exists and os.path.isfile(fp) and os.stat(fp).st_size > 0:
     return
   r = requests.get(url, stream=True)
   assert r.status_code == 200
   progress_bar = tqdm(total=int(r.headers.get('content-length', 0)), unit='B', unit_scale=True, desc=url)
-  with tempfile.NamedTemporaryFile(delete=False) as f:
+  with tempfile.NamedTemporaryFile(dir=pathlib.Path(fp).parent, delete=False) as f:
     for chunk in r.iter_content(chunk_size=16384):
       progress_bar.update(f.write(chunk))
     f.close()
     os.rename(f.name, fp)
+
 
 def my_unpickle(fb0):
   key_prelookup = defaultdict(list)
@@ -45,7 +58,7 @@ def my_unpickle(fb0):
       if DEBUG: print(f"unsupported type {storage_type} on {obj_key} with shape {size}")
       ret = None
     else:
-      ret = Tensor(LazyNumpyArray(lambda lst: np.zeros(lst.shape, dtype=lst.dtype), tuple(size), storage_type))
+      ret = Tensor.empty(*size, dtype=dtypes.from_np(storage_type))
     key_prelookup[obj_key].append((storage_type, obj_size, ret, size, stride, storage_offset))
     return ret
 

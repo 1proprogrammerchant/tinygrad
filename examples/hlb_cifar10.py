@@ -7,6 +7,7 @@ import time
 import numpy as np
 from datasets import fetch_cifar
 from tinygrad import nn
+from tinygrad.state import get_parameters, get_state_dict
 from tinygrad.nn import optim
 from tinygrad.tensor import Tensor
 from tinygrad.helpers import getenv
@@ -85,19 +86,23 @@ def train_cifar():
   model = SpeedyResNet()
 
   # init weights with torch
+  # TODO: it doesn't learn with the tinygrad weights, likely since kaiming init
   if getenv("TORCHWEIGHTS"):
     from examples.hlb_cifar10_torch import SpeedyResNet as SpeedyResNetTorch
     torch_model = SpeedyResNetTorch()
-    model_state_dict = optim.get_state_dict(model)
+    model_state_dict = get_state_dict(model)
     torch_state_dict = torch_model.state_dict()
     for k,v in torch_state_dict.items():
-      print(f"initting {k} from torch")
+      old_mean_std = model_state_dict[k].mean().numpy(), model_state_dict[k].std().numpy()
       model_state_dict[k].assign(Tensor(v.detach().numpy())).realize()
+      new_mean_std = model_state_dict[k].mean().numpy(), model_state_dict[k].std().numpy()
+      print(f"initted {k:40s} {str(model_state_dict[k].shape):20s} from torch mean:{old_mean_std[0]:8.5f} -> {new_mean_std[0]:8.5f} std:{old_mean_std[1]:8.5f} -> {new_mean_std[1]:8.5f}")
+    exit(0)
 
   if getenv("ADAM"):
-    optimizer = optim.Adam(optim.get_parameters(model), lr=Tensor([0.001]).realize())
+    optimizer = optim.Adam(get_parameters(model), lr=Tensor([0.001]).realize())
   else:
-    optimizer = optim.SGD(optim.get_parameters(model), lr=0.01, momentum=0.85, nesterov=True)
+    optimizer = optim.SGD(get_parameters(model), lr=0.01, momentum=0.85, nesterov=True)
 
   # 97 steps in 2 seconds = 20ms / step
   # step is 1163.42 GOPS = 56 TFLOPS!!!, 41% of max 136
@@ -114,7 +119,7 @@ def train_cifar():
       # use training batchnorm (and no_grad would change the kernels)
       out = model(Xt)
       outs = out.numpy().argmax(axis=1)
-      loss = (out * Yt).mean().numpy()[0]
+      loss = (out * Yt).mean().numpy()
       correct = outs == Yt.numpy().argmin(axis=1)
       print(f"eval {sum(correct)}/{len(correct)} {sum(correct)/len(correct)*100.0:.2f}%, {loss:7.2f} val_loss")
     if STEPS == 0: break
@@ -123,7 +128,7 @@ def train_cifar():
     loss = train_step_jitted(model, optimizer, X, Y)
     et = time.monotonic()
     X, Y = fetch_batch(X_train, Y_train, BS=BS)  # do this here
-    loss_cpu = loss.numpy()[0]
+    loss_cpu = loss.numpy()
     cl = time.monotonic()
     print(f"{i:3d} {(cl-st)*1000.0:7.2f} ms run, {(et-st)*1000.0:7.2f} ms python, {(cl-et)*1000.0:7.2f} ms CL, {loss_cpu:7.2f} loss, {GlobalCounters.mem_used/1e9:.2f} GB used, {GlobalCounters.global_ops*1e-9/(cl-st):9.2f} GFLOPS")
 

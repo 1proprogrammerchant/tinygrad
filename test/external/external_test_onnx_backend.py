@@ -4,6 +4,7 @@ import onnx.backend.test
 import numpy as np
 from tinygrad.tensor import Tensor
 from typing import Any, Tuple
+from tinygrad.helpers import getenv
 
 # pip3 install tabulate
 pytest_plugins = 'onnx.backend.test.report',
@@ -30,12 +31,12 @@ class TinygradBackend(Backend):
     print("prepare", cls, device, net_feed_input)
     run_onnx = get_run_onnx(model)
     return TinygradModel(run_onnx, net_feed_input)
-  
+
   @classmethod
   def supports_device(cls, device: str) -> bool:
     return device == "CPU"
 
-backend_test = onnx.backend.test.BackendTest(TinygradBackend, __name__) 
+backend_test = onnx.backend.test.BackendTest(TinygradBackend, __name__)
 
 # add support for SoftmaxCrossEntropyLoss and NegativeLogLikelihoodLoss
 backend_test.exclude('test_sce_*')
@@ -53,10 +54,15 @@ backend_test.exclude('test_momentum_*')
 backend_test.exclude('test_eyelike_*')
 
 # we only support float32
-backend_test.exclude('test_add_uint8_*')
-backend_test.exclude('test_sub_uint8_*')
-backend_test.exclude('test_div_uint8_*')
-backend_test.exclude('test_mul_uint8_*')
+backend_test.exclude('uint8')
+backend_test.exclude('uint16')
+backend_test.exclude('uint32')
+backend_test.exclude('uint64')
+backend_test.exclude('int8')
+backend_test.exclude('int16')
+backend_test.exclude('float64')
+backend_test.exclude('string')
+
 backend_test.exclude('test_pow_types_int*')
 backend_test.exclude('test_cast_*')
 backend_test.exclude('test_castlike_*')
@@ -65,8 +71,6 @@ backend_test.exclude('test_matmulinteger_*')
 
 # we don't support rounding
 backend_test.exclude('test_round_*')
-backend_test.exclude('test_ceil_*')
-backend_test.exclude('test_floor_*')
 
 # we don't support indexes
 backend_test.exclude('test_argmax_*')
@@ -87,18 +91,9 @@ backend_test.exclude('test_asin_*')
 backend_test.exclude('test_asinh_*')
 backend_test.exclude('test_atan_*')
 backend_test.exclude('test_atanh_*')
-# backend_test.include('test_cos_*')
-# backend_test.include('test_cosh_*')
-# backend_test.exclude('test_sin_*')
-# backend_test.include('test_sinh_*')
-# backend_test.include('test_tanh_*')
 
 # no boolean ops (2d, 3d, 4d)
-backend_test.exclude('test_and*')
-backend_test.exclude('test_xor*')
-backend_test.exclude('test_or*')
 backend_test.exclude('test_bitshift_*')
-backend_test.exclude('test_not_*')
 
 # no scatter gather
 backend_test.exclude('test_gather_*')
@@ -128,8 +123,10 @@ backend_test.exclude('test_bitwise_*')
 backend_test.exclude('test_blackmanwindow_*')
 backend_test.exclude('test_bernoulli_*')
 backend_test.exclude('test_cumsum_*')
-backend_test.exclude('test_tril_*')
-backend_test.exclude('test_triu_*')
+
+backend_test.exclude('test_tril_zero_cpu') # TODO: zero array support
+backend_test.exclude('test_triu_zero_cpu') # TODO: zero array support
+
 backend_test.exclude('test_col2im_*')
 backend_test.exclude('test_hammingwindow_*')
 backend_test.exclude('test_hannwindow_*')
@@ -151,8 +148,19 @@ backend_test.exclude('test_tfidfvectorizer_*')
 backend_test.exclude('test_stft_*')
 backend_test.exclude('test_melweightmatrix_*')
 
+# more strange ops
+backend_test.exclude('test_center_crop_pad_crop_*')
+backend_test.exclude('test_basic_deform_conv_*')
+backend_test.exclude('test_deform_conv_*')
+backend_test.exclude('test_lppool_*')
+backend_test.exclude('test_depthtospace_*')
+backend_test.exclude('test_spacetodepth_*')
+backend_test.exclude('test_scan*')
+backend_test.exclude('test_ai_onnx_ml_array_feature_extractor_*')
+backend_test.exclude('test_split_to_sequence_*')
+
 # disable model tests for now since they are slow
-if True:
+if not getenv("MODELTESTS"):
   for x in backend_test.test_suite:
     if 'OnnxBackendRealModelTest' in str(type(x)):
       backend_test.exclude(str(x).split(" ")[0])

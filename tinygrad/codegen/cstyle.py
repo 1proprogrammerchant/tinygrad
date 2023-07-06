@@ -1,8 +1,8 @@
 from typing import Final, Dict, Callable, ClassVar, List, Optional, NamedTuple, DefaultDict, Tuple, Set, Union
 import math, collections
-from tinygrad.codegen.linearizer import Linearizer, UOps, UOp, LocalBuffer, LocalTypes
+from tinygrad.codegen.linearizer import Linearizer, UOps, UOp, LocalBuffer
 from tinygrad.ops import ASTRunner, Op, UnaryOps, BinaryOps, FusedOps
-from tinygrad.helpers import getenv, partition, ImageDType, DEBUG, dtypes, colored
+from tinygrad.helpers import partition, ImageDType, DEBUG, dtypes, colored
 from tinygrad.runtime.lib import RawConst
 from tinygrad.shape.symbolic import DivNode, AndNode, render_python, NumNode, Variable, Node, SumNode, MulNode
 from tinygrad.lazy import LazyBuffer
@@ -11,8 +11,6 @@ from tinygrad.lazy import LazyBuffer
 render_cl = render_python.copy()
 render_cl[DivNode] = lambda self,ops,ctx: f"({self.a.render(ops, ctx)}/{self.b})"
 render_cl[AndNode] = lambda self,ops,ctx: f"({'&&'.join(sorted([x.render(ops,ctx) for x in self.nodes]))})"
-
-NATIVE_EXPLOG = getenv("NATIVE_EXPLOG", 0)  # this is needed as a switch for the tests to pass
 
 class CStyleLanguage(NamedTuple):
   kernel_prefix: str = ""
@@ -25,6 +23,7 @@ class CStyleLanguage(NamedTuple):
   extra_args: List[str] = []
   float4: Optional[str] = None
   half_prekernel: Optional[str] = None
+  double_prekernel: Optional[str] = None
   uses_vload: bool = False
 
 def to_image_idx(base_shape:Tuple[int, ...], idxy:Node, valid:Node, validhacks=False) -> Tuple[Node, Node]:
@@ -48,13 +47,14 @@ def to_image_idx(base_shape:Tuple[int, ...], idxy:Node, valid:Node, validhacks=F
   return idx, idy
 
 code_for_op: Final[Dict[Op, Callable]] = {
-  UnaryOps.EXP: lambda x: f"native_exp({x})" if NATIVE_EXPLOG else f"exp({x})",
-  UnaryOps.LOG: lambda x: f"native_log({x})" if NATIVE_EXPLOG else f"log({x})",
+  UnaryOps.EXP2: lambda x: f"exp2({x})",
+  UnaryOps.LOG2: lambda x: f"log2({x})",
   UnaryOps.SIN: lambda x: f"sin({x})",
+  UnaryOps.SQRT: lambda x: f"sqrt({x})",
   BinaryOps.ADD: lambda a,b: f"({a}+{b})", BinaryOps.SUB: lambda a,b: f"({a}-{b})",
   BinaryOps.MUL: lambda a,b: f"({a}*{b})", BinaryOps.DIV: lambda a,b: f"({a}/{b})",
-  BinaryOps.POW: lambda a,b: f"pow({a},{b})", BinaryOps.MAX: lambda a,b: f"max({a},{b})",
-  BinaryOps.CMPEQ: lambda a,b: f"({a}=={b})", FusedOps.MULACC: lambda a,b,c: f"(({b}*{c})+{a})"
+  BinaryOps.MAX: lambda a,b: f"max({a},{b})",
+  BinaryOps.CMPEQ: lambda a,b: f"({a}=={b})", FusedOps.MULACC: lambda a,b,c: f"(({a}*{b})+{c})"
 }
 
 def uops_to_cstyle(uops:List[UOp], bufs:List[Union[LocalBuffer,LazyBuffer]], lang:CStyleLanguage) -> Tuple[str, List[int], List[int]]:
@@ -64,14 +64,13 @@ def uops_to_cstyle(uops:List[UOp], bufs:List[Union[LocalBuffer,LazyBuffer]], lan
   local_size = []
   pend_close = None
 
-  bufnames = ["temp" if isinstance(b, LocalBuffer) else f"data{i}" for i,b in enumerate(bufs)]
+  bufnames = [b.name if isinstance(b, LocalBuffer) else f"data{i}" for i,b in enumerate(bufs)]
 
   depth = 0
   def kk(s): kernel.append("  "*depth+s)
 
   for uop,newvar,vin,args in uops:
     if uop == UOps.LOOP:
-      root = None
       for i,var in enumerate(args[0]):
         if isinstance(var, NumNode):
           if args[1] == "global" and lang.gid: global_size.append(1)
@@ -80,19 +79,9 @@ def uops_to_cstyle(uops:List[UOp], bufs:List[Union[LocalBuffer,LazyBuffer]], lan
           kk("{")
         else:
           if args[1] == "global" and lang.gid:
-            if len(args[0]) >= 4 and len(args[0])-i > 2:
-              # sometimes, there's more dimensions. compact all the dimensions into the last CL dimension
-              # TODO: these compactions should be searchable (they sort of are with reshapes and permutes)
-              if i == 0:
-                kk(f"{{ int {var.expr} = {lang.gid[-1]};  /* {var.max+1} */")
-                root = var.expr
-                global_size.append(var.max+1)
-              else:
-                kk(f"{{ int {var.expr} = {root} % {var.max+1}; {root} /= {var.max+1};")
-                global_size[-1] *= var.max+1
-            else:
-              kk(f"{{ int {var.expr} = {lang.gid[len(args[0])-1-i]};  /* {var.max+1} */")
-              global_size.append(var.max+1)
+            assert len(args[0]) <= len(lang.gid), f"too many global dimensions, has {len(args[0])} and {len(lang.gid)} are supported"
+            kk(f"{{ int {var.expr} = {lang.gid[len(args[0])-1-i]};  /* {var.max+1} */")
+            global_size.append(var.max+1)
           elif args[1] == "local" and lang.lid:
             assert len(args[0]) <= len(lang.lid)
             kk(f"{{ int {var.expr} = {lang.lid[len(args[0])-1-i]};  /* {var.max+1} */")
@@ -100,10 +89,11 @@ def uops_to_cstyle(uops:List[UOp], bufs:List[Union[LocalBuffer,LazyBuffer]], lan
           else:
             kk(f"for (int {var.expr} = {var.min}; {var.expr} <= {var.max}; ++{var.expr}) {{")
       depth += 1
+    elif uop == UOps.BARRIER:
+      kk(lang.barrier)
     elif uop == UOps.ENDLOOP:
       if args[1] == "local" and len(lang.lid):
         # TODO: this is a bit of a hack. the local loop isn't real on the GPU
-        kk(lang.barrier)
         kk(f"if ({Variable.sum(args[0]).render(render_cl)} == 0) {{")
         pend_close = "}"*(len(args[0])+1) + f" /* {args[1]} */"
       else:
@@ -117,7 +107,7 @@ def uops_to_cstyle(uops:List[UOp], bufs:List[Union[LocalBuffer,LazyBuffer]], lan
       assert newvar is not None
       if args == -math.inf:
         kk(f"{newvar.render(True)} = -INFINITY;")
-      elif newvar.ltype == LocalTypes.float4:
+      elif newvar.dtype == dtypes._float4:
         kk(f"{newvar.render(True)} = {{ {args}f, {args}f, {args}f, {args}f }};")
       else:
         kk(f"{newvar.render(True)} = {args}f;")
@@ -127,47 +117,53 @@ def uops_to_cstyle(uops:List[UOp], bufs:List[Union[LocalBuffer,LazyBuffer]], lan
         kk(f"{newvar.render()} = {code_for_op[args](*[x.render() for x in vin])};")
       else:
         kk(f"{newvar.render(True)} = {code_for_op[args](*[x.render() for x in vin])};")
-    elif uop == UOps.LOAD and newvar is not None and newvar.ltype == LocalTypes.float:
-      assert not isinstance(bufs[args.i].dtype, ImageDType), "image load must be float4"
+    elif uop == UOps.LOAD and newvar is not None:
       # TODO: merge with CONST?
       if bufs[args.i] is not None and isinstance(bufs[args.i].realized, RawConst):
-        # nan? inf?
-        val = f"{bufs[args.i].realized._buf}f"
-      else:
-        if lang.uses_vload and bufs[args.i].dtype == dtypes.float16:
-          val = f"vload_half({args.idx.render(render_cl)}, {bufnames[args.i]})"
-        else:
-          val = f"{bufnames[args.i]}[{args.idx.render(render_cl)}]"
-      # NOTE: if min and max are both 0, it should be a CONST in the Linearizer
-      if args.valid.min == 1: kk(f"float {newvar.name} = {val};")
-      else: kk(f"float {newvar.name} = ({args.valid.render(render_cl)}) ? ({val}) : 0.0f;")
-    elif uop == UOps.LOAD and newvar is not None and newvar.ltype == LocalTypes.float4:
-      assert newvar.offset is None, "load can't have an offset"
-      if isinstance(bufs[args.i].dtype, ImageDType):
+        assert newvar.dtype == dtypes.float, "const can't be float4"
+        x = bufs[args.i].realized._buf
+        if math.isnan(x): val = "NAN"
+        elif math.isinf(x): val = ("-" if x < 0 else "") + "INFINITY"
+        else: val = f"{x}" +  ("f" if not dtypes.is_int(bufs[args.i].dtype) else "")
+      elif isinstance(bufs[args.i].dtype, ImageDType):
+        assert newvar.dtype == dtypes._float4, f"image must be float4 {newvar}"
         prekernel.add("const sampler_t smp = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;\n")
         idx, idy = to_image_idx(bufs[args.i].dtype.shape, args.idx, args.valid)
         val = f"read_imagef({bufnames[args.i]}, smp, (int2)({idx.render(render_cl)}, {idy.render(render_cl)}))"
       else:
-        val = f"(({lang.smem_prefix if isinstance(bufs[args.i], LocalBuffer) else lang.buffer_prefix}float4*){bufnames[args.i]})[{(args.idx//4).render(render_cl)}]"
+        if lang.uses_vload and bufs[args.i].dtype == dtypes.float16:
+          if newvar.dtype == dtypes._float4:
+            val = f"vload_half4(0, {bufnames[args.i]}+{(args.idx).render(render_cl)})"
+          else:
+            val = f"vload_half({args.idx.render(render_cl)}, {bufnames[args.i]})"
+        else:
+          if newvar.dtype == dtypes._float4:
+            val = f"({newvar.dtype.name})(*(({lang.smem_prefix if isinstance(bufs[args.i], LocalBuffer) else lang.buffer_prefix}{bufs[args.i].dtype.name}4*)({bufnames[args.i]}+{args.idx.render(render_cl)})))"
+          else:
+            val = f"{bufnames[args.i]}[{args.idx.render(render_cl)}]"
       # NOTE: if min and max are both 0, it should be a CONST in the Linearizer
-      if args[2].min == 1: kk(f"{newvar.render(True)} = {val};")
-      else: kk(f"{newvar.render(True)} = ({args.valid.render(render_cl)}) ? ({val}) : {lang.float4}(0.0f, 0.0f, 0.0f, 0.0f);")
-    elif uop == UOps.STORE and (vin[0].ltype == LocalTypes.float or (vin[0].ltype == LocalTypes.float4 and vin[0].offset is not None)):
+      if args.valid.min == 1: kk(f"{newvar.render(True)} = {val};")
+      else:
+        casts = {dtypes._float4: ("", f"{lang.float4}(0.0f, 0.0f, 0.0f, 0.0f)"), dtypes.half: ("(half)", "(half)(0.0f)"), dtypes.float: ("(float)", "0.0f")}[newvar.dtype]
+        kk(f"{newvar.render(True)} = ({args.valid.render(render_cl)}) ? {casts[0]}({val}) : {casts[1]};")
+    elif uop == UOps.STORE and (vin[0].dtype == dtypes.float or (vin[0].dtype == dtypes._float4 and vin[0].offset is not None)):
       assert not isinstance(bufs[args.i].dtype, ImageDType), "image store must be float4"
       assert args.valid.min == 1, "store must be valid"
       if lang.uses_vload and bufs[args.i].dtype == dtypes.float16:
         kk(f"vstore_half({vin[0].render()}, {args.idx.render(render_cl)}, {bufnames[args.i]});")
       else:
         kk(f"{bufnames[args.i]}[{args.idx.render(render_cl)}] = {vin[0].render()};")
-    elif uop == UOps.CAST and newvar is not None and newvar.ltype == LocalTypes.float4:
+    elif uop == UOps.CAST and newvar is not None and newvar.dtype == dtypes._float4:
       kk(f"{newvar.render(True)} = {lang.float4}({','.join([x.render() for x in vin])});")
-    elif uop == UOps.STORE and len(vin) != 0 and vin[0].ltype == LocalTypes.float4 and vin[0].offset is None:
+    elif uop == UOps.STORE and len(vin) != 0 and vin[0].dtype == dtypes._float4 and vin[0].offset is None:
       assert args.valid.min == 1, "store must be valid"
       if isinstance(bufs[args[0]].dtype, ImageDType):
         idx, idy = to_image_idx(bufs[args.i].dtype.shape, args[1], args[2])
         kk(f"write_imagef({bufnames[args.i]}, (int2)({idx.render(render_cl)}, {idy.render(render_cl)}), {vin[0].render()});")
+      elif lang.uses_vload and bufs[args.i].dtype == dtypes.float16:
+        kk(f"vstore_half4({vin[0].render()}, {args.idx.render(render_cl)}, {bufnames[args.i]});")
       else:
-        kk(f"(({lang.smem_prefix if isinstance(bufs[args.i], LocalBuffer) else lang.buffer_prefix}float4*){bufnames[args.i]})[{(args.idx//4).render(render_cl)}] = {vin[0].render()};")
+        kk(f"*(({lang.smem_prefix if isinstance(bufs[args.i], LocalBuffer) else lang.buffer_prefix}{bufs[args.i].dtype.name}4*)({bufnames[args.i]}+{args.idx.render(render_cl)})) = ({bufs[args.i].dtype.name}4){vin[0].render()};")
     elif uop == UOps.DEFINE_LOCAL:
       kk(lang.smem_prefix + f"float {args[0]}[{args[1]}];")
     else:
@@ -180,12 +176,14 @@ def uops_to_cstyle(uops:List[UOp], bufs:List[Union[LocalBuffer,LazyBuffer]], lan
     [', '.join([f'{t} {bufnames[i]}' for i,t in buftypes] + lang.extra_args)] +
     [") {\n"] + list(prekernel) + ['\n'.join(kernel), "\n}"])
 
+  if lang.half_prekernel and any(x.dtype == dtypes.float16 for x in bufs): prg = ''.join([f"{lang.half_prekernel}", "\n", prg])
   return prg, global_size, local_size
 
 class CStyleCodegen(Linearizer):
   lang: ClassVar[CStyleLanguage] = CStyleLanguage()
   supports_constant_folding: bool = True
   supports_float4: bool = True
+  supports_float4_alu: bool = True
 
   # for renaming
   kernel_cnt: Final[DefaultDict[str, int]] = collections.defaultdict(int)
@@ -194,32 +192,18 @@ class CStyleCodegen(Linearizer):
   def codegen(self):
     self.process()
     self.hand_coded_optimizations()
-
-    # sometimes, there's more dimensions than len(self.lang.gid).
-    # compact all the dimensions into the first
-    # NOTE: this might make multiview shapetrackers
-    # TODO: this exposes bugs in the optimizers assuming the strides are on a single view
-    """
-    if len(self.lang.gid) and self.first_reduce > len(self.lang.gid):
-      num_to_merge = (self.first_reduce - len(self.lang.gid))+1
-      self.reshape_and_permute(lambda x: (prod(x[0:num_to_merge]),)+x[num_to_merge:], None)
-      if DEBUG >= 4: print("reshaped to", self.full_shape, "due to too many global dimensions")
-    """
-
+    self.limit_global_dims(len(self.lang.gid))
     self.linearize()
 
     prg, global_size, local_size = uops_to_cstyle(self.uops, self.bufs, self.lang)
-
-    # if we have local_sizes, we have to correct the global_size
-    for i,s in enumerate(local_size): global_size[i] *= s
 
     # painfully name the function something unique
     if prg in CStyleCodegen.kernel_name_cache: function_name, display_name = CStyleCodegen.kernel_name_cache[prg]
     else:
       CStyleCodegen.kernel_cnt[self.function_name] += 1
       suffix = f"{'n'+str(CStyleCodegen.kernel_cnt[self.function_name]-1)}" if CStyleCodegen.kernel_cnt[self.function_name] > 1 else ""
-      CStyleCodegen.kernel_name_cache[prg] = function_name, display_name = self.function_name+suffix, self.display_name+colored(suffix, 'black', bright=True)
+      CStyleCodegen.kernel_name_cache[prg] = function_name, display_name = self.function_name+suffix, self.display_name+colored(suffix, 'BLACK')
 
     return ASTRunner(function_name, prg.replace("KERNEL_NAME_PLACEHOLDER", function_name),
-      global_size[::-1] if len(global_size) else [1], local_size[::-1] if len(local_size) else None,
+      global_size[::-1], local_size[::-1],
       op_estimate=self.info.flops, mem_estimate=self.mem_estimate, display_name=display_name)

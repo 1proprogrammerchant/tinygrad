@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 import unittest
-from tinygrad.shape.symbolic import Variable, NumNode, Node
+from tinygrad.shape.symbolic import MulNode, SumNode, Variable, NumNode, Node
 
 class TestSymbolic(unittest.TestCase):
   def helper_test_variable(self, v, n, m, s):
@@ -11,8 +11,8 @@ class TestSymbolic(unittest.TestCase):
   def test_ge(self):
     self.helper_test_variable(Variable("a", 3, 8)>=77, 0, 0, "0")
     self.helper_test_variable(Variable("a", 3, 8)>=9, 0, 0, "0")
-    self.helper_test_variable(Variable("a", 3, 8)>=8, 0, 1, "(a>=8)")
-    self.helper_test_variable(Variable("a", 3, 8)>=4, 0, 1, "(a>=4)")
+    self.helper_test_variable(Variable("a", 3, 8)>=8, 0, 1, "((a*-1)<-7)")
+    self.helper_test_variable(Variable("a", 3, 8)>=4, 0, 1, "((a*-1)<-3)")
     self.helper_test_variable(Variable("a", 3, 8)>=3, 1, 1, "1")
     self.helper_test_variable(Variable("a", 3, 8)>=2, 1, 1, "1")
 
@@ -26,7 +26,7 @@ class TestSymbolic(unittest.TestCase):
 
   def test_ge_divides(self):
     expr = (Variable("idx", 0, 511)*4 + Variable("FLOAT4_INDEX", 0, 3)) < 512
-    self.helper_test_variable(expr, 0, 1, "(((idx*4)+FLOAT4_INDEX)<512)")
+    self.helper_test_variable(expr, 0, 1, "((idx*4)<512)")
     self.helper_test_variable(expr//4, 0, 1, "(idx<128)")
 
   def test_ge_divides_and(self):
@@ -36,6 +36,10 @@ class TestSymbolic(unittest.TestCase):
     expr = Variable.ands([(Variable("idx1", 0, 511)*4 + Variable("FLOAT4_INDEX", 0, 3)) < 512,
                           (Variable("idx2", 0, 511)*4 + Variable("FLOAT8_INDEX", 0, 7)) < 512])
     self.helper_test_variable(expr//4, 0, 1, "((((FLOAT8_INDEX//4)+idx2)<128) and (idx1<128))")
+
+  def test_lt_factors(self):
+    expr = Variable.ands([(Variable("idx1", 0, 511)*4 + Variable("FLOAT4_INDEX", 0, 256)) < 512])
+    self.helper_test_variable(expr, 0, 1, "(((idx1*4)+FLOAT4_INDEX)<512)")
 
   def test_div_becomes_num(self):
     assert isinstance(Variable("a", 2, 3)//2, NumNode)
@@ -177,6 +181,9 @@ class TestSymbolic(unittest.TestCase):
 
   def test_sum_combine_num(self):
     self.helper_test_variable(Variable.sum([Variable.num(29), Variable("a", 0, 10), Variable.num(-23)]), 6, 16, "(6+a)")
+
+  def test_sum_num_hoisted_and_factors_cancel_out(self):
+    self.helper_test_variable(Variable.sum([Variable("a", 0, 1) * -4 + 1, Variable("a", 0, 1) * 4]), 1, 1, "1")
 
   def test_div_factor(self):
     self.helper_test_variable(Variable.sum([Variable.num(-40), Variable("a", 0, 10)*2, Variable("b", 0, 10)*40]) // 40, -1, 9, "(-1+b)")

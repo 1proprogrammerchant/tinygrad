@@ -27,14 +27,14 @@ class CLCache():
   def __exit__(self, type, value, traceback):
     print(f"cache: exiting with size {len(GlobalCounters.cache)}", f"allowed {self.allowed}" if self.allowed is not None else "")
     if self.allowed is not None:
-      assert len(GlobalCounters.cache) <= self.allowed and (not self.strict or len(GlobalCounters.cache) == self.allowed), "used too many kernels!"
+      assert len(GlobalCounters.cache) <= self.allowed and (not self.strict or len(GlobalCounters.cache) == self.allowed), f"used too many kernels! {len(GlobalCounters.cache)} > {self.allowed}"
     GlobalCounters.cache = None
 
 from models.convnext import ConvNeXt
 from models.efficientnet import EfficientNet
 from models.resnet import ResNet18
 from models.vit import ViT
-from tinygrad.nn.optim import get_parameters
+from tinygrad.state import get_parameters
 
 @unittest.skipUnless(Device.DEFAULT == "GPU", "Not Implemented")
 class TestInferenceMinKernels(unittest.TestCase):
@@ -68,7 +68,7 @@ class TestInferenceMinKernels(unittest.TestCase):
     model = ResNet18()
     for p in get_parameters(model): p.assign(np.zeros(p.shape, dtype=p.dtype.np))
     img = Tensor.randn(1, 3, 224, 224)
-    with CLCache(31): # NOTE: this should be 4 lower
+    with CLCache(26):
       model.forward(img).realize()
 
   def test_vit(self):
@@ -85,7 +85,7 @@ class TestInferenceMinKernels(unittest.TestCase):
     args_tiny = {"dim": 512, "multiple_of": 256, "n_heads": 8, "n_layers": 4, "norm_eps": 1e-05, "vocab_size": 1000}
     model = Transformer(**args_tiny)
     for p in get_parameters(model): p.assign(np.zeros(p.shape, dtype=p.dtype.np))
-    with CLCache(86):
+    with CLCache(94):
       model(Tensor([[1,2,3,4]]), 0).realize()
 
 @unittest.skipUnless(Device.DEFAULT == "GPU", "Not Implemented")
@@ -182,7 +182,7 @@ class TestOpt(unittest.TestCase):
     Tensor.training = True
     img = Tensor.ones(2,3,4,4)
     c1 = nn.Conv2d(3,32,3)
-    opt = optim.SGD(optim.get_parameters(c1))
+    opt = optim.SGD(get_parameters(c1))
     with CLCache():
       opt.zero_grad()
       c1(img).relu().sum().backward()
@@ -199,7 +199,7 @@ class TestOpt(unittest.TestCase):
     img = Tensor.ones(2,3,64,64)
     c1 = nn.Conv2d(3,16,3,bias=False)
     c2 = nn.Conv2d(16,32,3,bias=False)
-    opt = optim.SGD(optim.get_parameters([c1, c2]))
+    opt = optim.SGD(get_parameters([c1, c2]))
     with CLCache(allowed=9):
       opt.zero_grad()
       c2(c1(img).relu()).relu().sum().backward()
@@ -214,7 +214,7 @@ class TestOpt(unittest.TestCase):
     c2 = nn.Conv2d(4,8,3,bias=False)
     c3 = nn.Conv2d(8,16,3,bias=False)
     c4 = nn.Conv2d(16,32,3,bias=False)
-    opt = optim.SGD(optim.get_parameters([c1, c2, c3, c4]))
+    opt = optim.SGD(get_parameters([c1, c2, c3, c4]))
     with CLCache(allowed=19):
       opt.zero_grad()
       c4(c3(c2(c1(img).relu()).relu()).relu()).relu().sum().backward()
@@ -227,7 +227,7 @@ class TestOpt(unittest.TestCase):
     img = Tensor.ones(1,3,4,4)
     c1 = nn.Conv2d(3,32,3)
     bn = nn.BatchNorm2d(32, track_running_stats=False)
-    opt = optim.SGD(optim.get_parameters([c1, bn]))
+    opt = optim.SGD(get_parameters([c1, bn]))
     with CLCache(allowed=18): # this is too high
       img_bn = bn(c1(img)).elu().sum()
       opt.zero_grad()

@@ -98,16 +98,17 @@ class LazyOp:
   src: Tuple[Union[LazyOp, LazyBuffer], ...]   # the sources
   arg: Optional[Any] = None                    # and an optional static argument
 
-# there's currently 20 Ops you have to implement for an accelerator.
-class UnaryOps(Enum):    NOOP = auto(); EXP = auto(); LOG = auto(); NEG = auto(); NOT = auto()
-class BinaryOps(Enum):   ADD = auto();  SUB = auto(); MUL = auto(); DIV = auto(); POW = auto(); CMPEQ = auto(); MAX = auto()
+# there's currently 27 Ops you have to implement for an accelerator.
+class UnaryOps(Enum):    NOOP = auto(); EXP2 = auto(); LOG2 = auto(); CAST = auto(); SIN = auto()
+class BinaryOps(Enum):   ADD = auto();  SUB = auto();  MUL = auto();  DIV = auto();  POW = auto(); CMPEQ = auto(); MAX = auto()
 class ReduceOps(Enum):   SUM = auto();  MAX = auto()
 class MovementOps(Enum): RESHAPE = auto(); PERMUTE = auto(); EXPAND = auto(); PAD = auto(); SHRINK = auto(); STRIDE = auto()
-class LoadOps(Enum):     FROMCPU = auto()
+class FusedOps(Enum):    MULACC = auto()
+class LoadOps(Enum):     EMPTY = auto(); RAND = auto(); CONST = auto(); FROM = auto(); CONTIGUOUS = auto(); CUSTOM = auto()
 # NOTE: if you have a CompiledBuffer(DeviceBuffer)
 #       you do not need to implement the MovementOps
 #       as they are handled by the ShapeTracker(in tinygrad/shape/shapetracker.py, code 7/10)
-Op = Union[UnaryOps, BinaryOps, ReduceOps, MovementOps, LoadOps]
+Op = Union[UnaryOps, BinaryOps, ReduceOps, MovementOps, FusedOps, LoadOps]
 
 # most of tinygrad/lazy.py is concerned with fusing Ops into LazyOps ASTs that map to GPUKernels
 # it's beyond the scope of this tutorial, but you can read the file if interested
@@ -130,11 +131,11 @@ assert lazyop.op == BinaryOps.ADD
 assert len(lazyop.src) == 2
 
 # the first source is the 2, it comes from the CPU
-# the source is a LazyBuffer, since FROMCPU cannot be folded into LazyOp ASTs
+# the source is a LazyBuffer, holding the data as an ndarray
 # again, a LazyOp AST is like a GPU kernel. you have to copy the data on the device first
 print(lazyop.src[0].op)
-assert lazyop.src[0].op.op == LoadOps.FROMCPU
-assert lazyop.src[0].op.arg.fxn == [2], "the arg of the FROMCPU LazyOP is the [2.]"
+assert lazyop.src[0].op.op == LoadOps.FROM
+assert lazyop.src[0].op.src[0].realized.toCPU()[0] == 2, "the arg of the FROM LazyOP is a LazyBuffer holding [2.]"
 assert result.lazydata.realized is None, "the LazyBuffer is not realized yet"
 
 # now we realize the LazyBuffer
@@ -157,7 +158,7 @@ class Interpreted:
 
   # and they have a lookup table to functions for the Ops
   fxn_for_op: Dict[Op, Callable] = {
-    UnaryOps.EXP: lambda x: np.exp(x),
+    UnaryOps.EXP2: lambda x: np.exp2(x),
     BinaryOps.ADD: lambda x,y: x+y}
 
 # Compiled backends take a little more (example: GPU and LLVM)
@@ -183,7 +184,7 @@ class Runtime(ABC):
 # == RawBuffer (in tinygrad/runtime/lib.py, code 5/10) ==
 import numpy as np
 
-# RawBuffer is where the data is actualy held. it's pretty close to just memory
+# RawBuffer is where the data is actually held. it's pretty close to just memory
 class RawBuffer(ABC):
   # create an empty rawbuffer that holds `size` elements of type `dtype`
   # `buf` is an opaque container class
@@ -216,7 +217,7 @@ from tinygrad.runtime.lib import RawMallocBuffer
 # ClangProgram is the simplest runtime (in tinygrad/runtime/ops_clang.py, code 7/10)
 # __init__ calls clang, and __call__ calls the function in the *.so outputted by clang
 # in CLANG, global_size and local_size are ignored
-from tinygrad.runtime.ops_clang import ClangProgram
+from tinygrad.runtime.ops_clang import ClangProgram, ClangCodegen
 
 # a concrete example looks like this, this adds two size 1 RawBuffer
 # first we create two numpy buffers containing 2 and 3
@@ -228,7 +229,7 @@ input_a, input_b = RawMallocBuffer.fromCPU(numpy_a), RawMallocBuffer.fromCPU(num
 output = RawMallocBuffer(1, dtypes.float32)
 
 # compile the program, run it, and 2+3 does indeed equal 5
-program = ClangProgram("add", "void add(float *a, float *b, float *c) { *a = *b + *c; }")
+program = ClangProgram("add", f"{ClangCodegen.lang.kernel_prefix} void add(float *a, float *b, float *c) {{ *a = *b + *c; }}")
 program(None, None, output, input_a, input_b)  # NOTE: the None are for global_size and local_size
 print(output.toCPU())
 assert output.toCPU()[0] == 5, "it's still 5"

@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import unittest
 import numpy as np
+from tinygrad.state import get_parameters, get_state_dict
 from tinygrad.nn import optim, Linear, Conv2d, BatchNorm2d
 from tinygrad.tensor import Tensor
 from datasets import fetch_mnist
@@ -9,12 +10,12 @@ from datasets import fetch_mnist
 def compare_tiny_torch(model, model_torch, X, Y):
   Tensor.training = True
   model_torch.train()
-  model_state_dict = optim.get_state_dict(model)
+  model_state_dict = get_state_dict(model)
   for k,v in model_torch.named_parameters():
     print(f"initting {k} from torch")
     model_state_dict[k].assign(Tensor(v.detach().numpy())).realize()
 
-  optimizer = optim.SGD(optim.get_parameters(model), lr=0.01)
+  optimizer = optim.SGD(get_parameters(model), lr=0.01)
   optimizer_torch = torch.optim.SGD(model_torch.parameters(), lr=0.01)
 
   Xt = torch.Tensor(X.numpy())
@@ -22,14 +23,14 @@ def compare_tiny_torch(model, model_torch, X, Y):
 
   out = model(X)
   loss = (out * Y).mean()
-  print(loss.realize().numpy()[0])
+  print(loss.realize().numpy())
 
   out_torch = model_torch(torch.Tensor(X.numpy()))
   loss_torch = (out_torch * torch.Tensor(Y.numpy())).mean()
   print(loss_torch.detach().numpy())
 
   # assert losses match
-  np.testing.assert_allclose(loss.realize().numpy()[0], loss_torch.detach().numpy(), atol=1e-4)
+  np.testing.assert_allclose(loss.realize().numpy(), loss_torch.detach().numpy(), atol=1e-4)
 
   # zero and backward
   optimizer.zero_grad()

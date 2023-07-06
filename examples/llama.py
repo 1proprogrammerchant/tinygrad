@@ -10,7 +10,7 @@ from tqdm import tqdm
 np.set_printoptions(linewidth=200)
 from typing import Optional, Tuple
 
-from tinygrad.helpers import getenv, DEBUG
+from tinygrad.helpers import dtypes, getenv, DEBUG
 from tinygrad.lazy import Device
 from extra.helpers import Timing
 from tinygrad.tensor import Tensor
@@ -25,10 +25,8 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
   return np.stack([np.cos(freqs), np.sin(freqs)], axis=-1).reshape(1, end, 1, dim//2, 2)
 
 # (a+i*b) * (c+i*d) = (ac-bd) + i*(ad+bc)
-def complex_mult(A, B):
-  assert len(A.shape) == 5 and len(B.shape) == 5
+def complex_mult(A, c, d):
   a,b = A[:, :, :, :, 0:1], A[:, :, :, :, 1:2]
-  c,d = B[:, :, :, :, 0:1], B[:, :, :, :, 1:2]
   ro = a*c - b*d
   co = a*d + b*c
   return ro.cat(co, dim=-1)
@@ -37,8 +35,10 @@ def apply_rotary_emb(xq, xk, freqs_cis) -> Tuple[Tensor, Tensor]:
   assert freqs_cis.shape[1] == xq.shape[1] and freqs_cis.shape[1] == xk.shape[1], f"freqs_cis shape mismatch {freqs_cis.shape} xq:{xq.shape} xk:{xk.shape}"
   xq = xq.reshape(*xq.shape[0:-1], -1, 2)
   xk = xk.reshape(*xk.shape[0:-1], -1, 2)
-  xq_out = complex_mult(xq, freqs_cis)
-  xk_out = complex_mult(xk, freqs_cis)
+  assert len(xq.shape) == 5 and len(xk.shape) == 5 and len(freqs_cis.shape) == 5
+  c, d = freqs_cis[:, :xq.shape[1], :, :, 0:1], freqs_cis[:, :xq.shape[1], :, :, 1:2]
+  xq_out = complex_mult(xq, c, d)
+  xk_out = complex_mult(xk, c, d)
   return xq_out.flatten(3), xk_out.flatten(3)
 
 class RMSNorm:
@@ -143,14 +143,13 @@ class Transformer:
 
     # get only the part we are using. making it contiguous avoids more kernel calls
     freqs_cis = self.freqs_cis[:, start_pos:start_pos+seqlen].contiguous().realize()
-
     if seqlen > 1:
       mask = np.full((1, 1, seqlen, start_pos + seqlen), float("-inf"), dtype=np.float32)
       mask = np.triu(mask, k=start_pos + 1)  # TODO: this is hard to do in tinygrad
       mask = Tensor(mask)
     else:
       mask = None
-
+    # mask = Tensor.full((1, 1, seqlen, start_pos + seqlen), float("-inf"), dtype=dtypes.float32).triu(start_pos+1) if seqlen > 1 else None #TODO: Pending(#942)
     for layer in self.layers:
       h.realize()  # TODO: why do i need this?
       h = layer(h, start_pos, freqs_cis, mask)
@@ -207,6 +206,7 @@ if __name__ == "__main__":
   args = parser.parse_args()
   chatbot = args.prompt == None
 
+  """
   # load model (you have to find the weights yourself)
   from extra.utils import fake_torch_load_zipped, get_child
 
@@ -262,6 +262,12 @@ if __name__ == "__main__":
       get_child(model, k).assign(v).realize()
 
     del weights
+  """
+
+  # disktensor loader isn't fast yet
+  model = Transformer(**args_7B)
+  from tinygrad.state import torch_load, load_state_dict
+  load_state_dict(model, torch_load(WEIGHTS_7B_FILENAME), strict=False)
 
   # *** prompt engineers work here ****
 
