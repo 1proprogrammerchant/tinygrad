@@ -1,11 +1,12 @@
-import subprocess, time, re, hashlib, tempfile
+import subprocess, time, re, hashlib, tempfile, os, functools
 from typing import Optional
 import numpy as np
 from pycuda.compiler import compile as cuda_compile # type: ignore
-from tinygrad.helpers import DEBUG, getenv, fromimport, colored
+from tinygrad.helpers import DEBUG, getenv, colored
 from tinygrad.ops import Compiled
 from tinygrad.runtime.lib import RawBufferCopyInOut, RawMallocBuffer
-from tinygrad.codegen.cstyle import CStyleCodegen, CStyleLanguage
+from tinygrad.codegen.linearizer import LinearizerOptions
+from tinygrad.renderer.cstyle import uops_to_cstyle, CStyleLanguage
 
 def pretty_ptx(s):
   # all expressions match `<valid_before><expr><valid_after>` and replace it with `<valid_before>color(<expr>)<valid_after>`
@@ -16,6 +17,7 @@ def pretty_ptx(s):
   s = re.sub(r'(\.)(param|reg|global)', lambda m:m[1]+colored(m[2], "magenta"), s, flags=re.M) # space
   s = re.sub(r'(\.)(version|target|address_size|visible|entry)', lambda m:m[1]+colored(m[2], "magenta"), s, flags=re.M) # derivatives
   return s
+def arch(): return "sm_" + "".join([str(x) for x in pycuda.driver.Context.get_device().compute_capability()])
 
 if getenv("CUDACPU", 0) == 1:
   import ctypes, ctypes.util
@@ -52,18 +54,19 @@ else:
 
 class CUDAProgram:
   def __init__(self, name:str, prg:str, binary=False):
-    try:
-      if DEBUG >= 6:
-        fn = f"{tempfile.gettempdir()}/tinycuda_{hashlib.md5(prg.encode('utf-8')).hexdigest()}"
-        with open(fn, "wb") as f:
-          f.write(cuda_compile(prg, target="cubin", no_extern_c=True))
-        sass = subprocess.check_output(['nvdisasm', fn]).decode('utf-8')
-        print(sass)
-      if not binary: prg = cuda_compile(prg, target="ptx", no_extern_c=True, options=['-Wno-deprecated-gpu-targets']).decode('utf-8')
-    except cuda.CompileError as e:
-      if DEBUG >= 3: print("FAILED TO BUILD", prg)
-      raise e
+    if not binary:
+      try: prg = cuda_compile(prg, target="ptx", no_extern_c=True, options=['-Wno-deprecated-gpu-targets']).decode('utf-8')
+      except cuda.CompileError as e:
+        if DEBUG >= 3: print("FAILED TO BUILD", prg)
+        raise e
     if DEBUG >= 5: print(pretty_ptx(prg))
+    if DEBUG >= 6:
+      try:
+        fn = os.path.join(tempfile.gettempdir(), f"tinycuda_{hashlib.md5(prg.encode('utf-8')).hexdigest()}")
+        with open(fn + ".ptx", "wb") as f: f.write(prg.encode('utf-8'))
+        subprocess.run(["ptxas", f"-arch={arch()}", "-o", fn, fn+".ptx"], check=True)
+        print(subprocess.check_output(['nvdisasm', fn]).decode('utf-8'))
+      except Exception as e: print("failed to generate SASS", str(e))
     # TODO: name is wrong, so we get it from the ptx using hacks
     self.prg = cuda.module_from_buffer(prg.encode('utf-8')).get_function(prg.split(".visible .entry ")[1].split("(")[0])
 
@@ -77,18 +80,16 @@ class CUDAProgram:
       end.synchronize()
       return start.time_till(end)*1e-3
 
-class CUDACodegen(CStyleCodegen):
-  lang = CStyleLanguage(
-    kernel_prefix = "__global__", smem_prefix = "__shared__ ", barrier = "__syncthreads();", float4 = "make_float4",
-    gid = [f'blockIdx.{chr(120+i)}' for i in range(3)],
-    lid = [f'threadIdx.{chr(120+i)}' for i in range(3)],
-    half_prekernel = """
-      #include <cuda_fp16.h>
-      struct __align__(8) half4 {
-        half2 x, y;
-        __device__ __forceinline__ explicit operator float4() const {return make_float4(__half2float(x.x), __half2float(x.y), __half2float(y.x), __half2float(y.y)); }
-      };
-    """)
-  supports_float4_alu = False
-
-CUDABuffer = Compiled(RawCUDABuffer, fromimport("tinygrad.codegen.assembly_ptx", "PTXCodegen") if getenv("PTX") else CUDACodegen, CUDAProgram, cuda.Context.synchronize)
+renderer = functools.partial(uops_to_cstyle, CStyleLanguage(
+  kernel_prefix = "__global__", smem_prefix = "__shared__ ", barrier = "__syncthreads();", float4 = "make_float4",
+  gid = [f'blockIdx.{chr(120+i)}' for i in range(3)],
+  lid = [f'threadIdx.{chr(120+i)}' for i in range(3)],
+  half_prekernel = """
+    #include <cuda_fp16.h>
+    struct __align__(8) half4 {
+      half2 x, y;
+      __device__ __forceinline__ explicit half4(const float4& a): x(make_half2(__float2half(a.x), __float2half(a.y))), y(make_half2(__float2half(a.z),__float2half(a.w))) {}
+      __device__ __forceinline__ explicit operator float4() const {return make_float4(__half2float(x.x), __half2float(x.y), __half2float(y.x), __half2float(y.y)); }
+    };
+  """))
+CUDABuffer = Compiled(RawCUDABuffer, LinearizerOptions(supports_float4_alu=False, global_max = [65535, 65535, 2147483647], local_max = [64, 1024, 1024]), renderer, CUDAProgram, cuda.Context.synchronize)

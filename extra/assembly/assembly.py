@@ -96,9 +96,8 @@ class AssemblyCodegen(Linearizer):
           ins.append(AssemblyInstruction(UOps.ALU, new_reg, [reg], UnaryOps.NOOP))
           reg = new_reg
         return tor[f"buf{args.i}"], reg, off
-      else:
-        reg = render_alu(BinaryOps.ADD, render_cast(reg, dtypes.uint64), tor[f"buf{args.i}"], dtype=dtypes.uint64)
-        return reg, None, off
+      reg = render_alu(BinaryOps.ADD, render_cast(reg, dtypes.uint64), tor[f"buf{args.i}"], dtype=dtypes.uint64)
+      return reg, None, off
 
     ins = []
     ins += [AssemblyInstruction(UOps.SPECIAL, newreg(f"buf{i}", dtype=dtypes.uint64, scalar=True), [], f"buf{i}") for i in range(len(self.bufs))]
@@ -139,7 +138,7 @@ class AssemblyCodegen(Linearizer):
       elif uop == UOps.ALU and newvar is not None:
         out = newreg(newvar) if newvar not in tor else tor[newvar]
         # this is the only thing that can violate SSA
-        if args in [BinaryOps.CMPEQ, BinaryOps.CMPLT]:
+        if args in [BinaryOps.CMPLT]:
           pred_reg = newreg((newvar, 'pred'), dtype=dtypes.bool)
           ins.append(AssemblyInstruction(UOps.ALU, pred_reg, [tor[x] for x in vin], args))
           ins.append(AssemblyInstruction(UOps.CAST, out, [pred_reg], args))

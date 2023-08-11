@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, functools, platform, time, re
+import os, functools, platform, time, re, contextlib
 from weakref import KeyedRef, ref
 from _weakref import _remove_dead_weakref # type: ignore
 import numpy as np
@@ -9,13 +9,10 @@ from math import prod # noqa: F401 # pylint:disable=unused-import
 ShapeType = Tuple[int, ...]
 # NOTE: helpers is not allowed to import from anything else in tinygrad
 OSX = platform.system() == "Darwin"
+CI = os.getenv("CI", "") != ""
 
 def dedup(x): return list(dict.fromkeys(x))   # retains list order
-def argfix(*x):
-  if x[0].__class__ in {tuple, list}:
-    try: return tuple(x[0])
-    except IndexError: return tuple()
-  return tuple(x)
+def argfix(*x): return tuple(x[0]) if x and x[0].__class__ in (tuple, list) else x
 def argsort(x): return type(x)(sorted(range(len(x)), key=x.__getitem__)) # https://stackoverflow.com/questions/3382352/equivalent-of-numpy-argsort-in-basic-python
 def all_same(items): return all(x == items[0] for x in items)
 def colored(st, color, background=False): return f"\u001b[{10*background+60*(color.upper() == color)+30+['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'].index(color.lower())}m{st}\u001b[0m" if color is not None else st  # replace the termcolor library with one line
@@ -29,28 +26,34 @@ def fromimport(mod, frm): return getattr(__import__(mod, fromlist=[frm]), frm)
 @functools.lru_cache(maxsize=None)
 def getenv(key, default=0): return type(default)(os.getenv(key, default))
 
-class Context:
-  def __init__(self, **kwargs): self.pvars = kwargs
-  def __enter__(self): ContextVar.ctx_stack.append({ **self.pvars, **{ key: ContextVar.ctx_stack[-1][key] for key in ContextVar.ctx_stack[-1].keys() if key not in self.pvars } })
-  def __exit__(self, *args): ContextVar.ctx_stack.pop()
+class Context(contextlib.ContextDecorator):
+  stack: ClassVar[List[dict[str, int]]] = [{}]
+  def __init__(self, **kwargs): self.kwargs = kwargs
+  def __enter__(self):
+    Context.stack[-1] = {k:o.value for k,o in ContextVar._cache.items()} # Store current state.
+    for k,v in self.kwargs.items(): ContextVar._cache[k].value = v # Update to new temporary state.
+    Context.stack.append(self.kwargs) # Store the temporary state so we know what to undo later.
+  def __exit__(self, *args):
+    for k in Context.stack.pop(): ContextVar._cache[k].value = Context.stack[-1].get(k, ContextVar._cache[k].value)
 
 class ContextVar:
-  ctx_stack: ClassVar[List[dict[str, Any]]] = [{}]
-  def __init__(self, key, default_value):
-    self.key, self.initial_value = key, getenv(key, default_value)
-    if key not in ContextVar.ctx_stack[-1]: ContextVar.ctx_stack[-1][key] = self.initial_value
-  def __call__(self, x): ContextVar.ctx_stack[-1][self.key] = x
-  def __bool__(self): return self.value != 0
+  _cache: ClassVar[Dict[str, ContextVar]] = {}
+  __slots__ = "value"
+  value: int
+  def __new__(cls, key, default_value):
+    if key in ContextVar._cache: return ContextVar._cache[key]
+    instance = ContextVar._cache[key] = super().__new__(cls)
+    instance.value = getenv(key, default_value)
+    return instance
+  def __bool__(self): return bool(self.value)
   def __ge__(self, x): return self.value >= x
   def __gt__(self, x): return self.value > x
   def __lt__(self, x): return self.value < x
-  @property
-  def value(self): return ContextVar.ctx_stack[-1][self.key] if self.key in ContextVar.ctx_stack[-1] else self.initial_value
 
 DEBUG, IMAGE = ContextVar("DEBUG", 0), ContextVar("IMAGE", 0)
 GRAPH, PRUNEGRAPH, GRAPHPATH = getenv("GRAPH", 0), getenv("PRUNEGRAPH", 0), getenv("GRAPHPATH", "/tmp/net")
 
-class Timing(object):
+class Timing(contextlib.ContextDecorator):
   def __init__(self, prefix="", on_exit=None, enabled=True): self.prefix, self.on_exit, self.enabled = prefix, on_exit, enabled
   def __enter__(self): self.st = time.perf_counter_ns()
   def __exit__(self, exc_type, exc_val, exc_tb):
@@ -95,11 +98,16 @@ class dtypes:
   float32: Final[DType] = DType(4, 4, "float", np.float32)
   float = float32
   int8: Final[DType] = DType(0, 1, "char", np.int8)
-  int32: Final[DType] = DType(1, 4, "int", np.int32)
-  int64: Final[DType] = DType(2, 8, "long", np.int64)
+  int16: Final[DType] = DType(1, 2, "short", np.int16)
+  int32: Final[DType] = DType(2, 4, "int", np.int32)
+  int64: Final[DType] = DType(3, 8, "long", np.int64)
   uint8: Final[DType] = DType(0, 1, "unsigned char", np.uint8)
-  uint32: Final[DType] = DType(1, 4, "unsigned int", np.uint32)
-  uint64: Final[DType] = DType(2, 8, "unsigned long", np.uint64)
+  uint16: Final[DType] = DType(1, 2, "unsigned short", np.uint16)
+  uint32: Final[DType] = DType(2, 4, "unsigned int", np.uint32)
+  uint64: Final[DType] = DType(3, 8, "unsigned long", np.uint64)
+
+  # NOTE: bfloat16 isn't supported in numpy
+  bfloat16: Final[DType] = DType(0, 2, "__bf16", None)
 
   # NOTE: these are internal dtypes, should probably check for that
   _half4: Final[DType] = DType(0, 2*4, "half4", None, 4)

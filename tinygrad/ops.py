@@ -2,9 +2,9 @@ from __future__ import annotations
 import functools, time
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Union, Type, Tuple, Any, List, Optional, Dict, Callable, cast
-from tinygrad.helpers import ansilen, prod, DEBUG, getenv, GlobalCounters, DType, colored
+from tinygrad.helpers import ansilen, prod, DEBUG, getenv, GlobalCounters, DType, colored, dedup
 from tinygrad.shape.shapetracker import MovementOps
-from tinygrad.runtime.lib import RawBuffer, RawConst
+from tinygrad.runtime.lib import RawBuffer, RawConst, buf_is_kernel_arg
 if TYPE_CHECKING:
   from tinygrad.lazy import LazyBuffer
 
@@ -13,13 +13,13 @@ if TYPE_CHECKING:
 # NOTE: MOD, CMPLT don't have to be implemented on vectors, just scalars
 # NOTE: rdna3 only has RECIP and not DIV. DIV and POW are on the chopping block
 class UnaryOps(Enum): NOOP = auto(); EXP2 = auto(); LOG2 = auto(); CAST = auto(); SIN = auto(); SQRT = auto(); RECIP = auto() # noqa: E702
-class BinaryOps(Enum): ADD = auto(); SUB = auto(); MUL = auto(); DIV = auto(); CMPEQ = auto(); MAX = auto(); MOD = auto(); CMPLT = auto() # noqa: E702
+class BinaryOps(Enum): ADD = auto(); SUB = auto(); MUL = auto(); DIV = auto(); MAX = auto(); MOD = auto(); CMPLT = auto() # noqa: E702
 class ReduceOps(Enum): SUM = auto(); MAX = auto() # noqa: E702
-class FusedOps(Enum): MULACC = auto() # noqa: E702
+class TernaryOps(Enum): MULACC = auto(); WHERE = auto() # noqa: E702
 class LoadOps(Enum): EMPTY = auto(); RAND = auto(); CONST = auto(); FROM = auto(); CONTIGUOUS = auto(); CUSTOM = auto() # noqa: E702
 
-Op = Union[UnaryOps, BinaryOps, ReduceOps, MovementOps, LoadOps, FusedOps]
-OpType = Union[Type[UnaryOps], Type[BinaryOps], Type[ReduceOps], Type[MovementOps], Type[LoadOps], Type[FusedOps]]
+Op = Union[UnaryOps, BinaryOps, ReduceOps, MovementOps, LoadOps, TernaryOps]
+OpType = Union[Type[UnaryOps], Type[BinaryOps], Type[ReduceOps], Type[MovementOps], Type[LoadOps], Type[TernaryOps]]
 
 class LazyOp:
   # TODO: add dest to support multiple outputs. on second thought, multiple outputs will have multiple LazyOps.
@@ -54,7 +54,7 @@ class LazyOp:
 
   def replace_with_movement_ops(self:LazyOp, ops:List[Tuple[MovementOps, Tuple[Any, ...]]]) -> 'LazyBuffer':
     from tinygrad.lazy import elementwise_op
-    assert self.op in BinaryOps or self.op in UnaryOps
+    assert self.op in BinaryOps or self.op in UnaryOps or self.op in TernaryOps
     return elementwise_op(self.op, *[z.replace_with_movement_ops(ops) for z in self.src], arg=self.arg)   # type: ignore
 
   @property
@@ -90,8 +90,8 @@ class Interpreted:
     self.codegen = None
 
   def exec_ast(self, ast:LazyOp, output=None, context=None, **kwargs):
-    if FusedOps.MULACC in self.fxn_for_op and ast.op == ReduceOps.SUM and ast.src[0].__class__ is LazyOp and ast.src[0].op == BinaryOps.MUL:
-      ast = LazyOp(FusedOps.MULACC, cast(LazyOp, ast.src[0]).src, ast.arg)
+    if TernaryOps.MULACC in self.fxn_for_op and ast.op == ReduceOps.SUM and ast.src[0].__class__ is LazyOp and ast.src[0].op == BinaryOps.MUL:
+      ast = LazyOp(TernaryOps.MULACC, cast(LazyOp, ast.src[0]).src, ast.arg)
     created_context = context is None
     if context is None: context = dict()
     if not created_context and ast in context: return context[ast]
@@ -104,8 +104,7 @@ class Interpreted:
       assert output.output_buffer.size == ret.size, output.output_buffer.dtype == ret.dtype
       output.output_buffer._buf = ret._buf
       return output.output_buffer
-    else:
-      return ret
+    return ret
 
 class FlopCounter:
   def __init__(self, tup:Tuple[Tuple[int, ...], DType, int]): self.shape, self.dtype, self.flops, self._buf = *tup, self
@@ -114,11 +113,12 @@ class FlopCounter:
     return ret
 from tinygrad.shape.shapetracker import ShapeTracker
 shape_fxn_for_op: Dict[Op, Callable] = {
-  UnaryOps.CAST: lambda self,dtype: (self.shape, dtype, self.consume_flops()),   # cast uses no flops
+  UnaryOps.CAST: lambda self,arg: (self.shape, arg[0], self.consume_flops()),   # cast uses no flops
   **{op:lambda self: (self.shape, self.dtype, self.consume_flops() + prod(self.shape)) for op in UnaryOps if op != UnaryOps.CAST},
   **{op:lambda self,y: (self.shape, max(self.dtype, y.dtype), self.consume_flops() + y.consume_flops() + prod(self.shape)) for op in BinaryOps},
   **{op:lambda self,new_shape: (new_shape, self.dtype, self.consume_flops() + prod(self.shape)) for op in ReduceOps},
-  **{op:functools.partial(lambda mop,self,arg: (ShapeTracker(self.shape).movement_op(mop, arg).shape, self.dtype, self.consume_flops()), op) for op in MovementOps}}
+  **{op:functools.partial(lambda mop,self,arg: (ShapeTracker(self.shape).movement_op(mop, arg).shape, self.dtype, self.consume_flops()), op) for op in MovementOps},
+  TernaryOps.WHERE: lambda self,y,z: (self.shape, self.dtype, self.consume_flops() + y.consume_flops() + z.consume_flops() + prod(self.shape))}
 InterpretedFlopCounter = Interpreted(FlopCounter, shape_fxn_for_op, lambda x: FlopCounter((x.shape, x.dtype, 0)), lambda x: x)
 def get_lazyop_info(ast:LazyOp) -> FlopCounter: return InterpretedFlopCounter.exec_ast(ast)
 
@@ -133,17 +133,17 @@ class ASTRunner:
     self.clprg = runtime(self.name, self.prg, **self.runtime_args)
     return self
 
-  def exec(self, bufs) -> Optional[float]:
-    rawbufs = [x.realized for x in bufs if x.realized is not None and x.realized.__class__ is not RawConst]
-    if GlobalCounters.cache is not None: GlobalCounters.cache.append((self, rawbufs))
-    return self(rawbufs)
+  def exec(self, bufs, force_wait=False, optimizing=False) -> Optional[float]:
+    rawbufs = dedup([x.realized for x in bufs if buf_is_kernel_arg(x)])
+    if GlobalCounters.cache is not None and not optimizing: GlobalCounters.cache.append((self, rawbufs))
+    return self(rawbufs, force_wait=force_wait)
 
   def __call__(self, rawbufs:List[RawBuffer], jit=False, force_wait=False) -> Optional[float]:
     if et := self.clprg((self.global_size + [1]*(3-len(self.global_size))) if self.global_size is not None else None,
                         (self.local_size + [1]*(3-len(self.local_size))) if self.local_size is not None else None,
                         *rawbufs, wait=force_wait or DEBUG>=1): GlobalCounters.time_sum_s += et
     if DEBUG >= 2:
-      print(f"{colored(f'*** {GlobalCounters.kernel_count:4d}', 'magenta' if jit else None)} {(self.display_name+' '*(29-ansilen(self.display_name))) if self.display_name is not None else self.name:26s} arg {len(rawbufs):3d} sz {str(self.global_size):18s} {str(self.local_size):12s} OPs {int(self.op_estimate/1e6):6d}M/{GlobalCounters.global_ops/1e9:7.2f}G  mem {GlobalCounters.mem_used/1e9:5.2f} GB " +
+      print(f"{colored(f'*** {GlobalCounters.kernel_count:4d}', 'magenta' if jit else None)} {(self.display_name+' '*(33-ansilen(self.display_name))) if self.display_name is not None else self.name:33s} arg {len(rawbufs):3d} sz {str(self.global_size):18s} {str(self.local_size):12s} OPs {int(self.op_estimate/1e6):6d}M/{GlobalCounters.global_ops/1e9:7.2f}G  mem {GlobalCounters.mem_used/1e9:5.2f} GB " +
             (str() if et is None else f"tm {et*1e6:9.2f}us/{GlobalCounters.time_sum_s*1e3:9.2f}ms ({self.op_estimate/((et or 1e-20)*1e9):8.2f} GFLOPS, {self.mem_estimate/((et or 1e-20)*1e9):7.2f} GB/s)"))
     GlobalCounters.kernel_count += 1
     GlobalCounters.global_ops += self.op_estimate
@@ -152,9 +152,16 @@ class ASTRunner:
     return et
 
 class Compiled:
-  def __init__(self, buffer: Type[RawBuffer], codegen, runtime, synchronize=lambda: None):
-    self.buffer, self.codegen, self.runtime, self.synchronize = buffer, codegen, runtime, synchronize
-    self.method_cache: Dict[str, ASTRunner] = {}
+  def __init__(self, buffer: Type[RawBuffer], linearizer_opts, renderer, runtime, synchronize=lambda: None):
+    self.buffer, self.linearizer_opts, self.renderer, self.runtime, self.synchronize = buffer, linearizer_opts, renderer, runtime, synchronize
+    self.method_cache: Dict[Any, ASTRunner] = {}
+
+  def to_program(self, k):
+    k.linearize()
+    src, global_size, local_size = self.renderer(k.function_name, k.uops)
+    return ASTRunner(k.function_name, src, global_size, local_size,
+                      op_estimate=k.info.flops, mem_estimate=k.mem_estimate,
+                      display_name=k.display_name).build(self.runtime)
 
   def exec_ast(self, ast:LazyOp, output, **kwargs):
     # all movementops do nothing in a Compiled buffer!
@@ -175,16 +182,21 @@ class Compiled:
     if not output.realized:
       output.realized = self.buffer(prod(output.shape), output.dtype, **kwargs)
 
-    # compilation time
-    k = self.codegen(ast, output)
+    from tinygrad.codegen.linearizer import Linearizer
+    k = Linearizer(ast, output, self.linearizer_opts)
 
-    # this is the default now
+    # compilation time
+    def get_program():
+      from tinygrad.codegen.optimizer import kernel_optimize, hand_coded_optimizations
+      if getenv("KOPT"): kernel_optimize(k, lambda: Linearizer(ast, output, self.linearizer_opts), self.to_program)
+      elif not getenv("NOOPT"): hand_coded_optimizations(k)
+      return self.to_program(k)
+
     if hasattr(k, 'key') and getenv("ENABLE_METHOD_CACHE", 1):
-      if k.key not in self.method_cache: self.method_cache[k.key] = k.codegen().build(self.runtime)
-      elif DEBUG >= 5: print(f"method cache hit : {k.key}")
+      if k.key not in self.method_cache: self.method_cache[k.key] = get_program()
       prg = self.method_cache[k.key]
     else:
-      prg = k.codegen().build(self.runtime)
+      prg = get_program()
 
     if prg.name == getenv("PRINT_PRG", ''): print(prg.prg)
 

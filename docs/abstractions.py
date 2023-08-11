@@ -98,17 +98,17 @@ class LazyOp:
   src: Tuple[Union[LazyOp, LazyBuffer], ...]   # the sources
   arg: Optional[Any] = None                    # and an optional static argument
 
-# there's currently 27 Ops you have to implement for an accelerator.
+# there's currently 28 Ops you have to implement for an accelerator.
 class UnaryOps(Enum):    NOOP = auto(); EXP2 = auto(); LOG2 = auto(); CAST = auto(); SIN = auto();   SQRT = auto()
-class BinaryOps(Enum):   ADD = auto();  SUB = auto();  MUL = auto();  DIV = auto();  CMPEQ = auto(); MAX = auto()
+class BinaryOps(Enum):   ADD = auto();  SUB = auto();  MUL = auto();  DIV = auto();  CMPLT = auto(); MAX = auto()
 class ReduceOps(Enum):   SUM = auto();  MAX = auto()
 class MovementOps(Enum): RESHAPE = auto(); PERMUTE = auto(); EXPAND = auto(); PAD = auto(); SHRINK = auto(); STRIDE = auto()
-class FusedOps(Enum):    MULACC = auto()
+class TernaryOps(Enum):  MULACC = auto(); WHERE = auto()
 class LoadOps(Enum):     EMPTY = auto(); RAND = auto(); CONST = auto(); FROM = auto(); CONTIGUOUS = auto(); CUSTOM = auto()
 # NOTE: if you have a CompiledBuffer(DeviceBuffer)
 #       you do not need to implement the MovementOps
 #       as they are handled by the ShapeTracker(in tinygrad/shape/shapetracker.py, code 7/10)
-Op = Union[UnaryOps, BinaryOps, ReduceOps, MovementOps, FusedOps, LoadOps]
+Op = Union[UnaryOps, BinaryOps, ReduceOps, MovementOps, TernaryOps, LoadOps]
 
 # most of tinygrad/lazy.py is concerned with fusing Ops into LazyOps ASTs that map to GPUKernels
 # it's beyond the scope of this tutorial, but you can read the file if interested
@@ -120,8 +120,7 @@ from tinygrad.tensor import Tensor
 from tinygrad.ops import LazyOp, BinaryOps, LoadOps
 
 # the 2+3 from before
-# added some 0s, otherwise Tensor([2]) will be folded into a constant without using LoadOps.FROM
-result = Tensor([2, 0]) + Tensor([3, 0])
+result = Tensor([2]) + Tensor([3])
 print(type(result.lazydata), result.lazydata)  # let's look at the lazydata of result
 
 # you'll see it has a LazyOp
@@ -218,7 +217,7 @@ from tinygrad.runtime.lib import RawMallocBuffer
 # ClangProgram is the simplest runtime (in tinygrad/runtime/ops_clang.py, code 7/10)
 # __init__ calls clang, and __call__ calls the function in the *.so outputted by clang
 # in CLANG, global_size and local_size are ignored
-from tinygrad.runtime.ops_clang import ClangProgram, ClangCodegen
+from tinygrad.runtime.ops_clang import ClangProgram
 
 # a concrete example looks like this, this adds two size 1 RawBuffer
 # first we create two numpy buffers containing 2 and 3
@@ -230,7 +229,7 @@ input_a, input_b = RawMallocBuffer.fromCPU(numpy_a), RawMallocBuffer.fromCPU(num
 output = RawMallocBuffer(1, dtypes.float32)
 
 # compile the program, run it, and 2+3 does indeed equal 5
-program = ClangProgram("add", f"{ClangCodegen.lang.kernel_prefix} void add(float *a, float *b, float *c) {{ *a = *b + *c; }}")
+program = ClangProgram("add", f"void add(float *a, float *b, float *c) {{ *a = *b + *c; }}")
 program(None, None, output, input_a, input_b)  # NOTE: the None are for global_size and local_size
 print(output.toCPU())
 assert output.toCPU()[0] == 5, "it's still 5"
@@ -266,12 +265,13 @@ class Linearizer:
   uops: List[UOp]
 
 from tinygrad.tensor import Tensor
-result = Tensor(2) + Tensor(3)
+from tinygrad.helpers import prod
+result = Tensor(2).realize() + Tensor(3).realize()
+result.lazydata.realized = Device[Device.DEFAULT].buffer(prod(result.shape), result.dtype)
 
 # use the real Linearizer to linearize 2+3
-from tinygrad.codegen.linearizer import Linearizer
-linearizer = Linearizer(result.lazydata.op, result.lazydata)
-linearizer.process()
+from tinygrad.codegen.linearizer import Linearizer, LinearizerOptions
+linearizer = Linearizer(result.lazydata.op, result.lazydata, LinearizerOptions())
 linearizer.linearize()
 
 # print the uops
@@ -279,12 +279,13 @@ for uop in linearizer.uops: print(uop)
 
 # output:
 """
+UOps.DEFINE_GLOBAL  :                           []                               ('data0', dtypes.float)
 UOps.LOOP           :                           []                               ([], 'global')
 UOps.LOOP           :                           []                               ([], 'local')
-UOps.LOAD           : <val1_0>                  []                               MemOp(i=1, idx=<0>, valid=<1>)
-UOps.LOAD           : <val2_0>                  []                               MemOp(i=2, idx=<0>, valid=<1>)
-UOps.ALU            : <alu0>                    [<val1_0>, <val2_0>]             BinaryOps.ADD
-UOps.STORE          :                           [<alu0>]                         MemOp(i=0, idx=<0>, valid=<1>)
+UOps.LOAD           : <acc1_0>                  []                               ConstOp(value=2.0, valid=<1>, invalid_value=0.0)
+UOps.LOAD           : <acc2_0>                  []                               ConstOp(value=3.0, valid=<1>, invalid_value=0.0)
+UOps.ALU            : <alu0>                    [<acc1_0>, <acc2_0>]             BinaryOps.ADD
+UOps.STORE          :                           [<alu0>]                         MemOp(name='data0', idx=<0>, local=False, memory_dtype=dtypes.float, valid=<1>, invalid_value=0.0)
 UOps.ENDLOOP        :                           []                               ([], 'global+local')
 """
 
